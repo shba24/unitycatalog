@@ -16,6 +16,7 @@ import io.unitycatalog.server.delta.model.DeltaSetProtocolUpdate;
 import io.unitycatalog.server.delta.model.DeltaSetSchemaUpdate;
 import io.unitycatalog.server.delta.model.DeltaSetTableCommentUpdate;
 import io.unitycatalog.server.delta.model.DeltaStructField;
+import io.unitycatalog.server.delta.model.DeltaStructFieldMetadata;
 import io.unitycatalog.server.delta.model.DeltaStructType;
 import io.unitycatalog.server.delta.model.DeltaTableRequirement;
 import io.unitycatalog.server.delta.model.DeltaTableUpdate;
@@ -469,15 +470,72 @@ public final class DeltaUpdateTableMapper {
       partitionNames = currentPartitionColumnNames(dao);
     }
     ColumnUtils.applyPartitionColumns(newColumns, partitionNames);
+    // Reuse the existing DAO UUID for columns whose CM identity key matches an existing column,
+    // so rename/reorder preserves the row identity that external systems may rely on.
+    Map<String, UUID> existingIdByKey = buildExistingCmIdMap(dao.getColumns());
     List<ColumnInfoDAO> newColumnDAOs = ColumnInfoDAO.fromList(newColumns);
     newColumnDAOs.forEach(
         c -> {
-          c.setId(UUID.randomUUID());
+          String cmKey = mappingKeyOf(c);
+          UUID reused = (cmKey != null) ? existingIdByKey.get(cmKey) : null;
+          c.setId(reused != null ? reused : UUID.randomUUID());
           c.setTable(dao);
         });
     dao.getColumns().clear();
     session.flush();
     dao.getColumns().addAll(newColumnDAOs);
+  }
+
+  /**
+   * Returns the column-mapping identity key for a DAO column. Prefers {@code
+   * delta.columnMapping.id} (id-mode), falls back to {@code delta.columnMapping.physicalName}
+   * (name-mode), and returns {@code null} if neither is present (no column mapping). The returned
+   * key includes a namespace prefix ({@code "id:"} or {@code "phys:"}) to prevent a numeric
+   * physical-name value from colliding with a real CM id.
+   */
+  private static String mappingKeyOf(ColumnInfoDAO dao) {
+    return mappingKeyOf(ColumnUtils.toStructField(dao.toColumnInfo()));
+  }
+
+  /**
+   * Returns the column-mapping identity key for a {@link ColumnInfo}. See {@link
+   * #mappingKeyOf(ColumnInfoDAO)}.
+   */
+  private static String mappingKeyOf(ColumnInfo column) {
+    return mappingKeyOf(ColumnUtils.toStructField(column));
+  }
+
+  /** Shared CM identity key extractor for a {@link DeltaStructField}. */
+  private static String mappingKeyOf(DeltaStructField field) {
+    DeltaStructFieldMetadata meta = field.getMetadata();
+    if (meta == null) {
+      return null;
+    }
+    Object id = meta.get("delta.columnMapping.id");
+    if (id != null) {
+      return "id:" + id;
+    }
+    Object physName = meta.get("delta.columnMapping.physicalName");
+    if (physName instanceof String s) {
+      return "phys:" + s;
+    }
+    return null;
+  }
+
+  /**
+   * Builds a map from CM identity key to the DAO's UUID for each existing column that carries CM
+   * metadata. Columns without CM metadata are silently skipped (their UUIDs are always minted fresh
+   * on replace).
+   */
+  private static Map<String, UUID> buildExistingCmIdMap(List<ColumnInfoDAO> existingDaos) {
+    Map<String, UUID> map = new HashMap<>();
+    for (ColumnInfoDAO dao : existingDaos) {
+      String key = mappingKeyOf(dao);
+      if (key != null) {
+        map.put(key, dao.getId());
+      }
+    }
+    return map;
   }
 
   /** Names of the DAO's partition columns, ordered by partition index. */

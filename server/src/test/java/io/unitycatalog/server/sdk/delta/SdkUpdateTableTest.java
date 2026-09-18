@@ -8,6 +8,7 @@ import io.unitycatalog.client.delta.model.DeltaAssertEtag;
 import io.unitycatalog.client.delta.model.DeltaAssertTableUUID;
 import io.unitycatalog.client.delta.model.DeltaClusteringDomainMetadata;
 import io.unitycatalog.client.delta.model.DeltaCommit;
+import io.unitycatalog.client.delta.model.DeltaCreateTableRequest;
 import io.unitycatalog.client.delta.model.DeltaDomainMetadataUpdates;
 import io.unitycatalog.client.delta.model.DeltaErrorType;
 import io.unitycatalog.client.delta.model.DeltaLoadTableResponse;
@@ -28,6 +29,7 @@ import io.unitycatalog.client.delta.model.DeltaStructField;
 import io.unitycatalog.client.delta.model.DeltaStructFieldMetadata;
 import io.unitycatalog.client.delta.model.DeltaStructType;
 import io.unitycatalog.client.delta.model.DeltaTableRequirement;
+import io.unitycatalog.client.delta.model.DeltaTableType;
 import io.unitycatalog.client.delta.model.DeltaTableUpdate;
 import io.unitycatalog.client.delta.model.DeltaUniformMetadata;
 import io.unitycatalog.client.delta.model.DeltaUniformMetadataIceberg;
@@ -54,10 +56,13 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.stream.Collectors;
+import org.hibernate.Session;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -1374,6 +1379,25 @@ public class SdkUpdateTableTest extends DeltaBaseTableCRUDTestEnv {
     Files.createDirectories(Path.of(URI.create(storageLocation + "/" + relativePath)));
   }
 
+  // ---------------------------------------------------------------- column-mapping identity tests
+
+  /**
+   * After a set-columns rename (logical "a" → "b", same physicalName "col-1"), the column's {@code
+   * ColumnInfoDAO.id} UUID must be reused, not freshly minted. Verifies Task 1: UUID preservation
+   * by CM identity on the name-mode path.
+   */
+  @Test
+  public void testRenameColumnPreservesColumnId() throws Exception {
+    Handle h = createCmNameModeManaged("tbl_rename_preserves_id");
+    UUID before = columnIdByName(h, "a");
+    updateTable(h, setColumnsRenaming("a", "b", "col-1"));
+    UUID after = columnIdByName(h, "b");
+    DeltaLoadTableResponse reloaded =
+        deltaTablesApi.loadTable(TestUtils.CATALOG_NAME, TestUtils.SCHEMA_NAME, h.name());
+    assertThat(columnNames(reloaded)).containsExactly("b");
+    assertThat(after).isEqualTo(before);
+  }
+
   // ---------------------------------------------------------------- helpers
 
   /** Pins the update to the table's UUID and the Handle's etag. */
@@ -1405,5 +1429,100 @@ public class SdkUpdateTableTest extends DeltaBaseTableCRUDTestEnv {
   /** Convenience: assert-table-uuid only, no assert-etag. */
   private static DeltaUpdateTableRequest requestWith(UUID assertUuid, DeltaTableUpdate... updates) {
     return requestWith(assertUuid, Optional.empty(), updates);
+  }
+
+  // -------------------------------------------------------- CM table creation helpers
+
+  /**
+   * Creates a MANAGED Delta table with column-mapping name-mode enabled. Schema: single column "a"
+   * (long, not null, physicalName "col-1", delta.columnMapping.id 1).
+   */
+  private Handle createCmNameModeManaged(String tableName) throws ApiException {
+    DeltaStagingTableResponse staging = createDeltaStaging(tableName);
+    Map<String, String> properties =
+        new HashMap<>(managedContractProperties(staging.getTableId().toString()));
+    properties.put("delta.columnMapping.mode", "name");
+    properties.put("delta.columnMapping.maxColumnId", "1");
+    DeltaStructFieldMetadata meta = new DeltaStructFieldMetadata();
+    meta.put("delta.columnMapping.id", 1);
+    meta.put("delta.columnMapping.physicalName", "col-1");
+    DeltaLoadTableResponse resp =
+        deltaTablesApi.createTable(
+            TestUtils.CATALOG_NAME,
+            TestUtils.SCHEMA_NAME,
+            new DeltaCreateTableRequest()
+                .name(tableName)
+                .location(staging.getLocation())
+                .tableType(DeltaTableType.MANAGED)
+                .columns(
+                    new DeltaStructType()
+                        .type("struct")
+                        .fields(
+                            List.of(
+                                new DeltaStructField()
+                                    .name("a")
+                                    .type(new DeltaPrimitiveType().type("long"))
+                                    .nullable(false)
+                                    .metadata(meta))))
+                .protocol(managedProtocol())
+                .domainMetadata(
+                    new DeltaDomainMetadataUpdates()
+                        .deltaRowTracking(
+                            new DeltaRowTrackingDomainMetadata().rowIdHighWaterMark(99L)))
+                .lastCommitTimestampMs(PLACEHOLDER_LAST_COMMIT_TIMESTAMP_MS)
+                .properties(properties));
+    return new Handle(tableName, staging.getTableId(), resp.getMetadata().getEtag());
+  }
+
+  // -------------------------------------------------------- CM update helpers
+
+  /**
+   * Builds a {@code set-columns} update that renames a single column from {@code oldName} to {@code
+   * newName}, preserving the given {@code physicalName} in the column-mapping metadata (name-mode:
+   * keyed on physicalName; CM id remains 1).
+   */
+  private static DeltaSetSchemaUpdate setColumnsRenaming(
+      String oldName, String newName, String physicalName) {
+    DeltaStructFieldMetadata meta = new DeltaStructFieldMetadata();
+    meta.put("delta.columnMapping.id", 1);
+    meta.put("delta.columnMapping.physicalName", physicalName);
+    return new DeltaSetSchemaUpdate()
+        .columns(
+            new DeltaStructType()
+                .type("struct")
+                .fields(
+                    List.of(
+                        new DeltaStructField()
+                            .name(newName)
+                            .type(new DeltaPrimitiveType().type("long"))
+                            .nullable(false)
+                            .metadata(meta))));
+  }
+
+  // -------------------------------------------------------- DB-level assertion helpers
+
+  /**
+   * Returns the {@code ColumnInfoDAO.id} UUID for the column with the given logical name in the
+   * table identified by {@code h}. Reads directly from the in-process Hibernate session factory so
+   * the test can assert on the DB-level identity that the REST API does not expose.
+   */
+  private UUID columnIdByName(Handle h, String colName) {
+    try (Session session = hibernateConfigurator.getSessionFactory().openSession()) {
+      return session
+          .createQuery(
+              "select c.id from ColumnInfoDAO c"
+                  + " where c.table.id = :tableId and c.name = :name",
+              UUID.class)
+          .setParameter("tableId", h.tableId())
+          .setParameter("name", colName)
+          .getSingleResult();
+    }
+  }
+
+  /** Returns the ordered list of top-level column names from a {@link DeltaLoadTableResponse}. */
+  private static List<String> columnNames(DeltaLoadTableResponse resp) {
+    return resp.getMetadata().getColumns().getFields().stream()
+        .map(DeltaStructField::getName)
+        .collect(Collectors.toList());
   }
 }
