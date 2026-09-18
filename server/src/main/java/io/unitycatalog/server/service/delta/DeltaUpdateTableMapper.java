@@ -1,10 +1,13 @@
 package io.unitycatalog.server.service.delta;
 
 import io.unitycatalog.server.delta.model.DeltaAddCommitUpdate;
+import io.unitycatalog.server.delta.model.DeltaArrayType;
 import io.unitycatalog.server.delta.model.DeltaAssertEtag;
 import io.unitycatalog.server.delta.model.DeltaAssertTableUUID;
 import io.unitycatalog.server.delta.model.DeltaCommit;
+import io.unitycatalog.server.delta.model.DeltaDataType;
 import io.unitycatalog.server.delta.model.DeltaDomainMetadataUpdates;
+import io.unitycatalog.server.delta.model.DeltaMapType;
 import io.unitycatalog.server.delta.model.DeltaProtocol;
 import io.unitycatalog.server.delta.model.DeltaRemoveDomainMetadataUpdate;
 import io.unitycatalog.server.delta.model.DeltaRemovePropertiesUpdate;
@@ -40,6 +43,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -364,7 +368,10 @@ public final class DeltaUpdateTableMapper {
       CollectedRequest collected,
       ServerProperties serverProperties) {
     CollectedUpdates c = collected.updates();
-    applySchemaAndPartitionColumns(session, dao, c.setSchema, c.setPartitionColumns);
+    String rawMode = properties.get(DeltaConsts.TableProperties.COLUMN_MAPPING_MODE);
+    String columnMappingMode = rawMode != null ? rawMode.trim().toLowerCase(Locale.ROOT) : "none";
+    applySchemaAndPartitionColumns(
+        session, dao, c.setSchema, c.setPartitionColumns, columnMappingMode);
     c.setProtocol.ifPresent(u -> applySetProtocol(properties, u.getProtocol()));
     c.setProperties.ifPresent(u -> applySetProperties(properties, u.getUpdates()));
     c.removeProperties.ifPresent(u -> applyRemoveProperties(properties, u.getRemovals()));
@@ -431,12 +438,17 @@ public final class DeltaUpdateTableMapper {
    * <p>Swap semantics rely on the orphanRemoval mapping on {@link TableInfoDAO#getColumns()} to
    * clean up the old rows; the intervening flush ensures the deletes hit the DB before the inserts,
    * so the {@code (table_id, ordinal_position, name)} unique constraint doesn't trip.
+   *
+   * <p>On every {@code set-columns} the DB-row UUID for each column is freshly minted (matching
+   * managed-catalog behaviour). All hard-validation guards for column-mapping rename/drop/reassign
+   * are enforced via {@link #validateColumnRenameAndDropGuards} before the swap runs.
    */
   private static void applySchemaAndPartitionColumns(
       Session session,
       TableInfoDAO dao,
       Optional<DeltaSetSchemaUpdate> setSchema,
-      Optional<DeltaSetPartitionColumnsUpdate> setPartition) {
+      Optional<DeltaSetPartitionColumnsUpdate> setPartition,
+      String columnMappingMode) {
     if (setSchema.isEmpty() && setPartition.isEmpty()) {
       return;
     }
@@ -471,25 +483,444 @@ public final class DeltaUpdateTableMapper {
       partitionNames = currentPartitionColumnNames(dao);
     }
     ColumnUtils.applyPartitionColumns(newColumns, partitionNames);
-    // Guard: reject any incoming column that shares a logical name with an existing column but has
-    // lost its column-mapping identity key (presence-only; value reassignment is out of scope).
+    // Hard-validation guards for column-mapping rename / drop / value-reassignment.
+    // Must run before validateNoCmIdentityStripped (G5) since the guards short-circuit early on
+    // no-CM and first-enable paths before G5 is reached.
     if (setSchema.isPresent()) {
+      validateColumnRenameAndDropGuards(dao.getColumns(), newColumns, columnMappingMode);
+      // G5: reject any incoming column that shares a logical name with an existing column but has
+      // lost its column-mapping identity key (presence-only).
       validateNoCmIdentityStripped(dao.getColumns(), newColumns);
     }
-    // Reuse the existing DAO UUID for columns whose CM identity key matches an existing column,
-    // so rename/reorder preserves the row identity that external systems may rely on.
-    Map<String, UUID> existingIdByKey = buildExistingCmIdMap(dao.getColumns());
+    // Build the new DAO list. On every set-columns, every column receives a fresh UUID (matching
+    // managed-catalog behaviour; the UUID has no known OSS consumers keying on it).
     List<ColumnInfoDAO> newColumnDAOs = ColumnInfoDAO.fromList(newColumns);
     newColumnDAOs.forEach(
         c -> {
-          String cmKey = mappingKeyOf(c);
-          UUID reused = (cmKey != null) ? existingIdByKey.get(cmKey) : null;
-          c.setId(reused != null ? reused : UUID.randomUUID());
+          c.setId(UUID.randomUUID());
           c.setTable(dao);
         });
     dao.getColumns().clear();
     session.flush();
     dao.getColumns().addAll(newColumnDAOs);
+  }
+
+  // ---------------------------------------------------------------------- column-mapping guards
+
+  /**
+   * Enforces all hard-validation guards for column-mapping correctness on a {@code set-columns}
+   * request. Guards G1-G8 mirror the DB UC (TS wrapper + managed-catalog) behaviour and are checked
+   * in the same order as the internal stack:
+   *
+   * <ul>
+   *   <li>G8 -- duplicate {@code delta.columnMapping.id} in the incoming schema (id-mode only,
+   *       globally across all nesting levels).
+   *   <li>G2 -- the incoming schema drops all column-mapping metadata while the current schema had
+   *       it ("dropped column mapping metadata").
+   *   <li>G1 -- no column mapping anywhere, but a column name was removed ("Column mapping is
+   *       required to rename or drop a column").
+   *   <li>G3 -- first-enable: an incoming column omits {@code delta.columnMapping.physicalName}
+   *       ("physical column name").
+   *   <li>G4 -- first-enable + rename in one request ("separate statement").
+   *   <li>G5 -- handled separately via {@link #validateNoCmIdentityStripped}.
+   *   <li>G6 -- more than one top-level rename in a single request ("single top-level column
+   *       rename").
+   *   <li>G7 -- same-name rename detected (new logical name case-insensitively equal to old) --
+   *       defensive dead code with the current {@code equalsIgnoreCase} detection filter
+   *       ("identical to the original").
+   *   <li>Reassignment -- retained column's CM key value changed (id-mode: {@code
+   *       delta.columnMapping.id}; name-mode: {@code delta.columnMapping.physicalName}).
+   * </ul>
+   */
+  private static void validateColumnRenameAndDropGuards(
+      List<ColumnInfoDAO> existingDaos,
+      List<ColumnInfo> incomingColumns,
+      String columnMappingMode) {
+    List<ColumnInfo> existingColumns = ColumnInfoDAO.toList(existingDaos);
+
+    // G8: duplicate delta.columnMapping.id in the incoming schema (id-mode only -- ids must be
+    // globally unique across all nesting levels; physicalName duplicates are not checked here).
+    detectDuplicateCmId(incomingColumns)
+        .ifPresent(
+            dupId -> {
+              throw new BaseException(
+                  ErrorCode.INVALID_ARGUMENT,
+                  "Duplicate column mapping id '" + dupId + "' in incoming schema.");
+            });
+
+    boolean currentHasCm = hasAnyCmMetadata(existingColumns);
+    boolean incomingHasCm = hasAnyCmMetadata(incomingColumns);
+
+    if (!incomingHasCm) {
+      if (currentHasCm) {
+        // G2: incoming schema removed all column-mapping metadata that was present.
+        throw new BaseException(
+            ErrorCode.INVALID_ARGUMENT,
+            "set-columns dropped column mapping metadata. "
+                + "Removing column mapping is not supported via the Delta REST catalog.");
+      }
+      // G1: neither schema has column-mapping metadata; reject any name removal (which would be a
+      // rename or drop without mapping, causing silent data loss in the underlying storage).
+      List<String> removedNames = namesRemovedWithoutMapping(existingColumns, incomingColumns);
+      if (!removedNames.isEmpty()) {
+        throw new BaseException(
+            ErrorCode.INVALID_ARGUMENT,
+            "Column mapping is required to rename or drop a column; '"
+                + removedNames.get(0)
+                + "' cannot be removed while column mapping is disabled. "
+                + "Enable column mapping first.");
+      }
+      // No CM anywhere, no names removed: pass through (add / reorder / type-change are safe).
+      return;
+    }
+
+    if (!currentHasCm) {
+      // First-enable path: the incoming schema introduces column-mapping metadata for the first
+      // time (current has none).
+
+      // G3: every top-level incoming column must carry physicalName so a hidden rename can be
+      // safely ruled out (physicalName == current logical name on first-enable by convention).
+      if (hasAnyMissingPhysicalName(incomingColumns)) {
+        throw new BaseException(
+            ErrorCode.INVALID_ARGUMENT,
+            "set-columns: enabling column mapping requires a physical column name "
+                + "for every top-level column; this request omits one, so a rename cannot be "
+                + "safely ruled out.");
+      }
+
+      // G4: first-enable + rename in the same request is not supported. UC splits column-mapping
+      // enable and rename into two separate commits; a single-commit rename would degrade to a
+      // drop+add in managed-catalog.
+      List<String> feRenames = detectFirstEnableRenames(existingColumns, incomingColumns);
+      if (!feRenames.isEmpty()) {
+        throw new BaseException(
+            ErrorCode.INVALID_ARGUMENT,
+            "set-columns: renaming a column while enabling column mapping is not supported "
+                + "in a single request. Enable column mapping in a separate statement, "
+                + "then rename the column.");
+      }
+      // Plain CM-enable with no rename: pass through.
+      return;
+    }
+
+    // Normal path: the current schema already has column-mapping metadata.
+
+    // G6: at most one top-level rename per request.
+    List<TopLevelRename> topLevelRenames = detectTopLevelRenames(existingColumns, incomingColumns);
+    if (topLevelRenames.size() > 1) {
+      String renameList =
+          topLevelRenames.stream()
+              .map(r -> r.oldLogicalName() + "->" + r.newLogicalName())
+              .sorted()
+              .collect(Collectors.joining(", "));
+      throw new BaseException(
+          ErrorCode.INVALID_ARGUMENT,
+          "Only a single top-level column rename is supported per request; this request renames "
+              + topLevelRenames.size()
+              + " columns ["
+              + renameList
+              + "]. Split them into separate ALTER statements.");
+    }
+
+    // G7: defensive guard -- a "rename" where the new name is case-insensitively equal to the old
+    // name is a same-name rename (identical to the original). With the equalsIgnoreCase filter
+    // inside detectTopLevelRenames this branch is dead code in practice; it remains as a safety
+    // net in case detection logic changes.
+    for (TopLevelRename rename : topLevelRenames) {
+      if (rename.newLogicalName().equalsIgnoreCase(rename.oldLogicalName())) {
+        throw new BaseException(
+            ErrorCode.INVALID_ARGUMENT,
+            "Column rename to '"
+                + rename.newLogicalName()
+                + "' is identical to the original column name.");
+      }
+    }
+
+    // Reassignment guard: a retained column (same logical name in both schemas) must not change
+    // its column-mapping key value. The mode (id vs. name) determines which key to check.
+    // columnMappingMode is passed in from the table property (delta.columnMapping.mode).
+    if (!"none".equals(columnMappingMode)) {
+      List<String> reassigned =
+          detectCmValueReassignment(existingColumns, incomingColumns, columnMappingMode);
+      if (!reassigned.isEmpty()) {
+        reassigned = new ArrayList<>(reassigned);
+        reassigned.sort(String::compareTo);
+        String keyName = "id".equals(columnMappingMode) ? "id" : "physicalName";
+        throw new BaseException(
+            ErrorCode.INVALID_ARGUMENT,
+            "Column mapping "
+                + keyName
+                + " reassignment is not supported for retained column(s): "
+                + String.join(", ", reassigned));
+      }
+    }
+  }
+
+  /**
+   * Returns {@code true} if any column in {@code columns} carries a column-mapping identity key
+   * ({@code delta.columnMapping.id} or {@code delta.columnMapping.physicalName}) in its {@code
+   * type_json} metadata.
+   */
+  private static boolean hasAnyCmMetadata(List<ColumnInfo> columns) {
+    return columns.stream().anyMatch(c -> mappingKeyOf(c) != null);
+  }
+
+  /**
+   * Returns the logical names of top-level columns present in {@code current} but absent (by
+   * case-insensitive name comparison) from {@code incoming}. A non-empty result signals that a
+   * column was renamed or dropped without column-mapping metadata to track the identity change --
+   * which would cause silent data loss in the underlying storage engine.
+   */
+  private static List<String> namesRemovedWithoutMapping(
+      List<ColumnInfo> current, List<ColumnInfo> incoming) {
+    Set<String> incomingByLower =
+        incoming.stream()
+            .map(c -> c.getName().toLowerCase(Locale.ROOT))
+            .collect(Collectors.toSet());
+    List<String> removed = new ArrayList<>();
+    for (ColumnInfo cur : current) {
+      if (!incomingByLower.contains(cur.getName().toLowerCase(Locale.ROOT))) {
+        removed.add(cur.getName());
+      }
+    }
+    return removed;
+  }
+
+  /**
+   * Returns {@code true} if any top-level incoming column lacks a {@code
+   * delta.columnMapping.physicalName} metadata entry. Used by the G3 guard to detect a first-enable
+   * request where a hidden rename cannot be safely ruled out.
+   */
+  private static boolean hasAnyMissingPhysicalName(List<ColumnInfo> columns) {
+    for (ColumnInfo c : columns) {
+      DeltaStructField field = ColumnUtils.toStructField(c);
+      DeltaStructFieldMetadata meta = field.getMetadata();
+      if (meta == null || meta.get("delta.columnMapping.physicalName") == null) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Detects column renames on the first-enable path: incoming physicalName matches a current
+   * column's logical name (by Delta convention physicalName == current logical name on
+   * first-enable) but the incoming logical name differs, indicating a hidden rename.
+   *
+   * @return human-readable rename descriptions, e.g. {@code "oldName -> newName"}
+   */
+  private static List<String> detectFirstEnableRenames(
+      List<ColumnInfo> currentColumns, List<ColumnInfo> incomingColumns) {
+    Map<String, String> currentByLower =
+        currentColumns.stream()
+            .collect(
+                Collectors.toMap(c -> c.getName().toLowerCase(Locale.ROOT), ColumnInfo::getName));
+    List<String> renames = new ArrayList<>();
+    for (ColumnInfo inc : incomingColumns) {
+      DeltaStructField field = ColumnUtils.toStructField(inc);
+      DeltaStructFieldMetadata meta = field.getMetadata();
+      if (meta == null) continue;
+      Object physObj = meta.get("delta.columnMapping.physicalName");
+      if (!(physObj instanceof String physName)) continue;
+      // By Delta convention on first-enable, physicalName == current logical name; a mismatch
+      // between the incoming logical name and the current column whose logical name equals the
+      // physicalName is a rename.
+      String currentLogical = currentByLower.get(physName.toLowerCase(Locale.ROOT));
+      if (currentLogical != null && !inc.getName().equalsIgnoreCase(currentLogical)) {
+        renames.add(currentLogical + " -> " + inc.getName());
+      }
+    }
+    return renames;
+  }
+
+  /**
+   * Represents a detected top-level column rename: the column's CM identity key stayed the same
+   * (physicalName in name-mode, {@code delta.columnMapping.id} in id-mode) while its logical name
+   * changed.
+   */
+  private record TopLevelRename(String oldLogicalName, String newLogicalName) {}
+
+  /**
+   * Detects top-level column renames by matching current and incoming columns on their CM identity
+   * key (per-column: prefers {@code delta.columnMapping.id}; falls back to {@code
+   * delta.columnMapping.physicalName}). Only top-level columns are compared; nested struct-field
+   * renames ride inside the column's {@code type_json} and are not surfaced here.
+   *
+   * <p>Case-insensitive name comparison: a change from "A" to "a" is not considered a rename
+   * (matching the DB UC TS-wrapper's {@code equalsIgnoreCase} filter). This is the reason G7 cannot
+   * be triggered in the current implementation.
+   */
+  private static List<TopLevelRename> detectTopLevelRenames(
+      List<ColumnInfo> currentColumns, List<ColumnInfo> incomingColumns) {
+    Map<String, String> currentByKey = new HashMap<>();
+    for (ColumnInfo c : currentColumns) {
+      String key = mappingKeyOf(c);
+      if (key != null) currentByKey.put(key, c.getName());
+    }
+    Map<String, String> incomingByKey = new HashMap<>();
+    for (ColumnInfo c : incomingColumns) {
+      String key = mappingKeyOf(c);
+      if (key != null) incomingByKey.put(key, c.getName());
+    }
+    List<TopLevelRename> renames = new ArrayList<>();
+    for (Map.Entry<String, String> entry : currentByKey.entrySet()) {
+      String oldName = entry.getValue();
+      String newName = incomingByKey.get(entry.getKey());
+      // equalsIgnoreCase: case-only changes ("A"→"a") are not renames.
+      if (newName != null && !newName.equalsIgnoreCase(oldName)) {
+        renames.add(new TopLevelRename(oldName, newName));
+      }
+    }
+    return renames;
+  }
+
+  /**
+   * Detects duplicate {@code delta.columnMapping.id} values in the incoming schema, recursing into
+   * nested struct, array, and map types. Column IDs must be globally unique across all nesting
+   * levels in id-mode.
+   *
+   * @return the first duplicate id found, or empty if all ids are unique
+   */
+  private static Optional<String> detectDuplicateCmId(List<ColumnInfo> incomingColumns) {
+    Set<String> seen = new HashSet<>();
+    for (ColumnInfo c : incomingColumns) {
+      DeltaStructField field = ColumnUtils.toStructField(c);
+      Optional<String> dup = collectCmIds(field, seen);
+      if (dup.isPresent()) return dup;
+    }
+    return Optional.empty();
+  }
+
+  /** Checks {@code field}'s CM id and recurses into its type for further nested ids. */
+  private static Optional<String> collectCmIds(DeltaStructField field, Set<String> seen) {
+    DeltaStructFieldMetadata meta = field.getMetadata();
+    if (meta != null) {
+      Object idObj = meta.get("delta.columnMapping.id");
+      if (idObj != null) {
+        String id = idObj.toString();
+        if (!seen.add(id)) {
+          return Optional.of(id);
+        }
+      }
+    }
+    return collectCmIdsInType(field.getType(), seen);
+  }
+
+  /** Recurses into complex types (struct / array / map) to collect CM ids. */
+  private static Optional<String> collectCmIdsInType(DeltaDataType type, Set<String> seen) {
+    if (type instanceof DeltaStructType struct) {
+      List<DeltaStructField> fields = struct.getFields();
+      if (fields != null) {
+        for (DeltaStructField f : fields) {
+          Optional<String> dup = collectCmIds(f, seen);
+          if (dup.isPresent()) return dup;
+        }
+      }
+    } else if (type instanceof DeltaArrayType array) {
+      return collectCmIdsInType(array.getElementType(), seen);
+    } else if (type instanceof DeltaMapType map) {
+      Optional<String> dup = collectCmIdsInType(map.getKeyType(), seen);
+      if (dup.isPresent()) return dup;
+      return collectCmIdsInType(map.getValueType(), seen);
+    }
+    return Optional.empty();
+  }
+
+  /**
+   * Detects column-mapping key value reassignment on retained columns (columns with the same
+   * logical name in both the current and incoming schemas). In id-mode, the {@code
+   * delta.columnMapping.id} value must not change; in name-mode, the {@code
+   * delta.columnMapping.physicalName} value must not change. Recurses into nested struct fields.
+   *
+   * @return sorted list of logical names of columns whose CM key value was reassigned
+   */
+  private static List<String> detectCmValueReassignment(
+      List<ColumnInfo> currentColumns, List<ColumnInfo> incomingColumns, String mode) {
+    Map<String, ColumnInfo> currentByLower =
+        currentColumns.stream()
+            .collect(
+                Collectors.toMap(c -> c.getName().toLowerCase(Locale.ROOT), Function.identity()));
+    List<String> violations = new ArrayList<>();
+    for (ColumnInfo inc : incomingColumns) {
+      ColumnInfo cur = currentByLower.get(inc.getName().toLowerCase(Locale.ROOT));
+      if (cur != null) {
+        DeltaStructField curField = ColumnUtils.toStructField(cur);
+        DeltaStructField incField = ColumnUtils.toStructField(inc);
+        violations.addAll(checkCmValueConsistency(curField, incField, mode, inc.getName()));
+      }
+    }
+    return violations;
+  }
+
+  /**
+   * Checks that the CM key value of {@code incField} matches {@code curField} for the given {@code
+   * mode}, and recurses into any nested struct / array / map types. Returns the logical names of
+   * fields (at the path described by {@code fieldLabel}) whose CM key value changed.
+   */
+  private static List<String> checkCmValueConsistency(
+      DeltaStructField curField, DeltaStructField incField, String mode, String fieldLabel) {
+    List<String> violations = new ArrayList<>();
+    String cmKey =
+        "id".equals(mode) ? "delta.columnMapping.id" : "delta.columnMapping.physicalName";
+    String curValue = getCmKeyValue(curField, cmKey);
+    String incValue = getCmKeyValue(incField, cmKey);
+    // Only flag when BOTH schemas carry the key (presence-only strip is handled by G5).
+    if (curValue != null && incValue != null && !curValue.equals(incValue)) {
+      violations.add(fieldLabel);
+    }
+    // Recurse into nested struct types via the type trees.
+    violations.addAll(
+        checkCmValueConsistencyInTypes(curField.getType(), incField.getType(), mode, fieldLabel));
+    return violations;
+  }
+
+  /** Recurses into matching complex-type pairs to check CM value consistency of nested fields. */
+  private static List<String> checkCmValueConsistencyInTypes(
+      DeltaDataType curType, DeltaDataType incType, String mode, String parentLabel) {
+    List<String> violations = new ArrayList<>();
+    if (curType instanceof DeltaStructType curStruct
+        && incType instanceof DeltaStructType incStruct) {
+      List<DeltaStructField> curFields =
+          curStruct.getFields() != null ? curStruct.getFields() : List.of();
+      // Build a map of current nested fields by lower-case logical name.
+      Map<String, DeltaStructField> curByLower =
+          curFields.stream()
+              .collect(
+                  Collectors.toMap(f -> f.getName().toLowerCase(Locale.ROOT), Function.identity()));
+      List<DeltaStructField> incFields =
+          incStruct.getFields() != null ? incStruct.getFields() : List.of();
+      for (DeltaStructField incF : incFields) {
+        DeltaStructField curF = curByLower.get(incF.getName().toLowerCase(Locale.ROOT));
+        if (curF != null) {
+          violations.addAll(
+              checkCmValueConsistency(curF, incF, mode, parentLabel + "." + incF.getName()));
+        }
+      }
+    } else if (curType instanceof DeltaArrayType curArr
+        && incType instanceof DeltaArrayType incArr) {
+      violations.addAll(
+          checkCmValueConsistencyInTypes(
+              curArr.getElementType(), incArr.getElementType(), mode, parentLabel));
+    } else if (curType instanceof DeltaMapType curMap && incType instanceof DeltaMapType incMap) {
+      violations.addAll(
+          checkCmValueConsistencyInTypes(
+              curMap.getKeyType(), incMap.getKeyType(), mode, parentLabel));
+      violations.addAll(
+          checkCmValueConsistencyInTypes(
+              curMap.getValueType(), incMap.getValueType(), mode, parentLabel));
+    }
+    return violations;
+  }
+
+  /**
+   * Returns the string value of {@code cmKey} from {@code field}'s metadata, or {@code null} if the
+   * key is absent or its value is null.
+   */
+  private static String getCmKeyValue(DeltaStructField field, String cmKey) {
+    DeltaStructFieldMetadata meta = field.getMetadata();
+    if (meta == null) return null;
+    Object val = meta.get(cmKey);
+    return val != null ? val.toString() : null;
   }
 
   /**
@@ -529,28 +960,13 @@ public final class DeltaUpdateTableMapper {
   }
 
   /**
-   * Builds a map from CM identity key to the DAO's UUID for each existing column that carries CM
-   * metadata. Columns without CM metadata are silently skipped (their UUIDs are always minted fresh
-   * on replace).
-   */
-  private static Map<String, UUID> buildExistingCmIdMap(List<ColumnInfoDAO> existingDaos) {
-    Map<String, UUID> map = new HashMap<>();
-    for (ColumnInfoDAO dao : existingDaos) {
-      String key = mappingKeyOf(dao);
-      if (key != null) {
-        map.put(key, dao.getId());
-      }
-    }
-    return map;
-  }
-
-  /**
    * Rejects a {@code set-columns} where a column present in both the existing schema and the
    * incoming schema (matched by logical name) has lost its column-mapping identity key. This is a
    * presence-only check: value reassignment ({@code id} or {@code physicalName} changed while still
-   * present) is not validated here.
+   * present) is validated separately by the reassignment guard in {@link
+   * #validateColumnRenameAndDropGuards}.
    *
-   * <p>Columns with no CM identity in the existing schema are not subject to this check — they can
+   * <p>Columns with no CM identity in the existing schema are not subject to this check -- they can
    * safely transition to or from CM metadata.
    *
    * @throws BaseException with {@link ErrorCode#INVALID_ARGUMENT} naming the offending columns
