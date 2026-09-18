@@ -35,6 +35,7 @@ import io.unitycatalog.server.service.delta.DeltaConsts.TableProperties;
 import io.unitycatalog.server.utils.ColumnUtils;
 import io.unitycatalog.server.utils.ServerProperties;
 import io.unitycatalog.server.utils.ValidationUtils;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -470,6 +471,11 @@ public final class DeltaUpdateTableMapper {
       partitionNames = currentPartitionColumnNames(dao);
     }
     ColumnUtils.applyPartitionColumns(newColumns, partitionNames);
+    // Guard: reject any incoming column that shares a logical name with an existing column but has
+    // lost its column-mapping identity key (presence-only; value reassignment is out of scope).
+    if (setSchema.isPresent()) {
+      validateNoCmIdentityStripped(dao.getColumns(), newColumns);
+    }
     // Reuse the existing DAO UUID for columns whose CM identity key matches an existing column,
     // so rename/reorder preserves the row identity that external systems may rely on.
     Map<String, UUID> existingIdByKey = buildExistingCmIdMap(dao.getColumns());
@@ -536,6 +542,43 @@ public final class DeltaUpdateTableMapper {
       }
     }
     return map;
+  }
+
+  /**
+   * Rejects a {@code set-columns} where a column present in both the existing schema and the
+   * incoming schema (matched by logical name) has lost its column-mapping identity key. This is a
+   * presence-only check: value reassignment ({@code id} or {@code physicalName} changed while still
+   * present) is not validated here.
+   *
+   * <p>Columns with no CM identity in the existing schema are not subject to this check — they can
+   * safely transition to or from CM metadata.
+   *
+   * @throws BaseException with {@link ErrorCode#INVALID_ARGUMENT} naming the offending columns
+   */
+  private static void validateNoCmIdentityStripped(
+      List<ColumnInfoDAO> existingDaos, List<ColumnInfo> incomingColumns) {
+    // Build a map from logical name to CM key for existing columns that have CM metadata.
+    Map<String, String> existingCmKeyByName = new HashMap<>();
+    for (ColumnInfoDAO dao : existingDaos) {
+      String key = mappingKeyOf(dao);
+      if (key != null) {
+        existingCmKeyByName.put(dao.getName(), key);
+      }
+    }
+    // Find columns that are retained (same logical name) but lost their CM identity key.
+    List<String> stripped = new ArrayList<>();
+    for (ColumnInfo col : incomingColumns) {
+      if (existingCmKeyByName.containsKey(col.getName()) && mappingKeyOf(col) == null) {
+        stripped.add(col.getName());
+      }
+    }
+    if (!stripped.isEmpty()) {
+      stripped.sort(String::compareTo);
+      throw new BaseException(
+          ErrorCode.INVALID_ARGUMENT,
+          "set-columns dropped column mapping metadata for column(s): "
+              + String.join(", ", stripped));
+    }
   }
 
   /** Names of the DAO's partition columns, ordered by partition index. */

@@ -1398,6 +1398,20 @@ public class SdkUpdateTableTest extends DeltaBaseTableCRUDTestEnv {
     assertThat(after).isEqualTo(before);
   }
 
+  /**
+   * set-columns that retains a column by logical name but strips its column-mapping identity key
+   * (present in the existing schema, absent in the incoming schema) must be rejected with {@code
+   * INVALID_ARGUMENT}. Verifies Task 2: presence-only strip guard.
+   */
+  @Test
+  public void testSetColumnsDroppingColumnMappingMetadataIsRejected() throws Exception {
+    Handle h = createCmNameModeManaged("tbl_drop_cm_meta");
+    TestUtils.assertDeltaApiException(
+        () -> updateTable(h, setColumnsWithoutMappingMetadataFor("a")),
+        DeltaErrorType.INVALID_PARAMETER_VALUE_EXCEPTION,
+        "set-columns dropped column mapping metadata for column(s): a");
+  }
+
   // ---------------------------------------------------------------- helpers
 
   /** Pins the update to the table's UUID and the Handle's etag. */
@@ -1497,6 +1511,24 @@ public class SdkUpdateTableTest extends DeltaBaseTableCRUDTestEnv {
                             .type(new DeltaPrimitiveType().type("long"))
                             .nullable(false)
                             .metadata(meta))));
+  }
+
+  /**
+   * Builds a {@code set-columns} update for column {@code colName} with its column-mapping metadata
+   * stripped (empty metadata). Used by the Task 2 strip-guard test.
+   */
+  private static DeltaSetSchemaUpdate setColumnsWithoutMappingMetadataFor(String colName) {
+    return new DeltaSetSchemaUpdate()
+        .columns(
+            new DeltaStructType()
+                .type("struct")
+                .fields(
+                    List.of(
+                        new DeltaStructField()
+                            .name(colName)
+                            .type(new DeltaPrimitiveType().type("long"))
+                            .nullable(false)
+                            .metadata(new DeltaStructFieldMetadata()))));
   }
 
   // -------------------------------------------------------- DB-level assertion helpers
