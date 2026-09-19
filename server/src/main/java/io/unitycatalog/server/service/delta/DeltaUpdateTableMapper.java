@@ -193,11 +193,12 @@ public final class DeltaUpdateTableMapper {
      * omitted: it is EXTERNAL-only and so can never co-occur with {@code add-commit}.
      *
      * <p>A {@code set-domain-metadata} that touches only the {@code delta.rowTracking} domain does
-     * not count: the Delta protocol requires writers to advance the row-tracking high-water mark in
-     * every commit that assigns fresh row IDs, so clients mirror it alongside otherwise data-only
-     * {@code add-commit}s. It is per-commit snapshot bookkeeping, not a metadata change; counting
-     * it would advance {@code updatedAt} and the {@code delta.lastUpdateVersion} stamp on every
-     * data commit of a row-tracking table. The high-water-mark property itself is still persisted.
+     * not count: row-tracking high-water-mark updates are per-commit snapshot bookkeeping, not
+     * metadata changes. The Delta protocol requires writers to mirror the high-water mark in every
+     * commit that assigns fresh row IDs, so clients send it alongside otherwise data-only {@code
+     * add-commit}s. Counting it as a metadata change would incorrectly advance {@code updatedAt}
+     * and the {@code delta.lastUpdateVersion} stamp on every data commit of a row-tracking table.
+     * The high-water-mark property itself is still persisted.
      */
     boolean hasManagedTableMetadataChange() {
       return setProperties.isPresent()
@@ -439,9 +440,10 @@ public final class DeltaUpdateTableMapper {
    * clean up the old rows; the intervening flush ensures the deletes hit the DB before the inserts,
    * so the {@code (table_id, ordinal_position, name)} unique constraint doesn't trip.
    *
-   * <p>On every {@code set-columns} the DB-row UUID for each column is freshly minted (matching
-   * managed-catalog behaviour). All hard-validation guards for column-mapping rename/drop/reassign
-   * are enforced via {@link #validateColumnRenameAndDropGuards} before the swap runs.
+   * <p>On every {@code set-columns}, each column receives a fresh database UUID (to match standard
+   * catalog semantics where column identity is refreshed on every set-columns). All hard-validation
+   * guards for column-mapping rename/drop/reassign are enforced via {@link
+   * #validateColumnRenameAndDropGuards} before the swap runs.
    */
   private static void applySchemaAndPartitionColumns(
       Session session,
@@ -484,16 +486,16 @@ public final class DeltaUpdateTableMapper {
     }
     ColumnUtils.applyPartitionColumns(newColumns, partitionNames);
     // Hard-validation guards for column-mapping rename / drop / value-reassignment.
-    // Must run before validateNoCmIdentityStripped (G5) since the guards short-circuit early on
-    // no-CM and first-enable paths before G5 is reached.
+    // Must run before validateNoCmIdentityStripped since the guards short-circuit early on
+    // no-CM and first-enable paths before the identity-strip check is reached.
     if (setSchema.isPresent()) {
       validateColumnRenameAndDropGuards(dao.getColumns(), newColumns, columnMappingMode);
-      // G5: reject any retained column (same logical name) that lost its active mode CM key.
+      // Reject any retained column (same logical name) that lost its active mode CM key.
       // Mode-specific and recursive into nested types.
       validateNoCmIdentityStripped(dao.getColumns(), newColumns, columnMappingMode);
     }
-    // Build the new DAO list. On every set-columns, every column receives a fresh UUID (matching
-    // managed-catalog behaviour; the UUID has no known OSS consumers keying on it).
+    // Build the new DAO list. On every set-columns, every column receives a fresh UUID
+    // (standard catalog semantics; the UUID has no known OSS consumers keying on it).
     List<ColumnInfoDAO> newColumnDAOs = ColumnInfoDAO.fromList(newColumns);
     newColumnDAOs.forEach(
         c -> {
@@ -509,27 +511,26 @@ public final class DeltaUpdateTableMapper {
 
   /**
    * Enforces all hard-validation guards for column-mapping correctness on a {@code set-columns}
-   * request. Guards G1-G8 mirror the DB UC (TS wrapper + managed-catalog) behaviour and are checked
-   * in the same order as the internal stack:
+   * request, checked in order of execution:
    *
    * <ul>
-   *   <li>G8 -- duplicate {@code delta.columnMapping.id} in the incoming schema (id-mode only,
+   *   <li>Reject a duplicate {@code delta.columnMapping.id} in the incoming schema (id-mode only,
    *       globally across all nesting levels).
-   *   <li>G2 -- the incoming schema drops all column-mapping metadata while the current schema had
-   *       it ("dropped column mapping metadata").
-   *   <li>G1 -- no column mapping anywhere, but a column name was removed ("Column mapping is
-   *       required to rename or drop a column").
-   *   <li>G3 -- first-enable: an incoming column omits {@code delta.columnMapping.physicalName}
-   *       ("physical column name").
-   *   <li>G4 -- first-enable + rename in one request ("separate statement").
-   *   <li>G5 -- handled separately via {@link #validateNoCmIdentityStripped}.
-   *   <li>G6 -- more than one top-level rename in a single request ("single top-level column
-   *       rename").
-   *   <li>G7 -- same-name rename detected (new logical name case-insensitively equal to old) --
-   *       defensive dead code with the current {@code equalsIgnoreCase} detection filter
-   *       ("identical to the original").
-   *   <li>Reassignment -- retained column's CM key value changed (id-mode: {@code
+   *   <li>Reject the incoming schema dropping all column-mapping metadata when the current schema
+   *       had it.
+   *   <li>Reject any column name removal without column-mapping metadata (would cause silent data
+   *       loss).
+   *   <li>For first-enable (adding CM where none existed): reject any incoming column that omits
+   *       {@code delta.columnMapping.physicalName}.
+   *   <li>For first-enable: reject any rename in the same request (renames must be separate after
+   *       CM enablement).
+   *   <li>Reject more than one top-level column rename per request.
+   *   <li>Reject a same-name rename (case-insensitive). This is a defensive check; case-only
+   *       changes are filtered during detection.
+   *   <li>Reject a retained column whose column-mapping key value changed (id-mode: {@code
    *       delta.columnMapping.id}; name-mode: {@code delta.columnMapping.physicalName}).
+   *   <li>Reject stripping the active mode's CM identity key from a retained column (handled via
+   *       {@link #validateNoCmIdentityStripped}).
    * </ul>
    */
   private static void validateColumnRenameAndDropGuards(
@@ -538,7 +539,7 @@ public final class DeltaUpdateTableMapper {
       String columnMappingMode) {
     List<ColumnInfo> existingColumns = ColumnInfoDAO.toList(existingDaos);
 
-    // G8: duplicate delta.columnMapping.id in the incoming schema (id-mode only -- ids must be
+    // Reject duplicate delta.columnMapping.id in the incoming schema (id-mode only -- ids must be
     // globally unique across all nesting levels; physicalName duplicates are not checked here).
     detectDuplicateCmId(incomingColumns)
         .ifPresent(
@@ -548,11 +549,11 @@ public final class DeltaUpdateTableMapper {
                   "Duplicate column mapping id '" + dupId + "' in incoming schema.");
             });
 
-    // Mode-specific CM presence checks mirror the wrapper's columnMappingKeyToLogical approach:
-    // whether the ACTIVE mode's key (delta.columnMapping.id for id-mode,
-    // delta.columnMapping.physicalName for name-mode) is present anywhere in the schema
-    // (recursively, across all nesting levels).  For "none" mode the active key is null and both
-    // flags are false, so the code falls through to the G1 / first-enable logic below.
+    // Mode-specific CM presence checks: determine whether the ACTIVE mode's key
+    // (delta.columnMapping.id for id-mode, delta.columnMapping.physicalName for name-mode) is
+    // present anywhere in the schema (recursively, across all nesting levels). For "none" mode the
+    // active key is null and both flags are false, so the code falls through to the
+    // rename-without-mapping / first-enable logic below.
     String activeCmKey = activeCmKeyForMode(columnMappingMode);
     boolean currentHasActiveCm =
         activeCmKey != null && hasCmKeyAnywhere(existingColumns, activeCmKey);
@@ -564,14 +565,14 @@ public final class DeltaUpdateTableMapper {
 
     if (!incomingHasActiveCm) {
       if (currentHasActiveCm) {
-        // G2: incoming schema dropped the active mode's CM key while current schema had it.
+        // Reject: incoming schema dropped the active mode's CM key while current schema had it.
         throw new BaseException(
             ErrorCode.INVALID_ARGUMENT,
             "set-columns dropped column mapping metadata. "
                 + "Removing column mapping is not supported via the Delta REST catalog.");
       }
       if (!incomingHasAnyCm) {
-        // G1: neither schema has any CM metadata; reject any name removal.
+        // Reject any name removal when neither schema has any CM metadata.
         List<String> removedNames = namesRemovedWithoutMapping(existingColumns, incomingColumns);
         if (!removedNames.isEmpty()) {
           throw new BaseException(
@@ -590,8 +591,8 @@ public final class DeltaUpdateTableMapper {
     if (!currentHasActiveCm) {
       // First-enable path: current has no active-mode CM key; incoming introduces CM.
 
-      // G3: every top-level incoming column must carry physicalName so a hidden rename can be
-      // safely ruled out (physicalName == current logical name on first-enable by convention).
+      // Every top-level incoming column must carry physicalName so a hidden rename can be
+      // safely ruled out (by convention, physicalName == current logical name on first-enable).
       if (hasAnyMissingPhysicalName(incomingColumns)) {
         throw new BaseException(
             ErrorCode.INVALID_ARGUMENT,
@@ -600,9 +601,9 @@ public final class DeltaUpdateTableMapper {
                 + "safely ruled out.");
       }
 
-      // G4: first-enable + rename in the same request is not supported. UC splits column-mapping
-      // enable and rename into two separate commits; a single-commit rename would degrade to a
-      // drop+add in managed-catalog.
+      // First-enable + rename in the same request is not supported. Column-mapping enable and
+      // rename must be separate operations, since enabling CM changes the identity semantics and
+      // merging both into one commit would degrade the rename to a drop+add at the storage level.
       List<String> feRenames = detectFirstEnableRenames(existingColumns, incomingColumns);
       if (!feRenames.isEmpty()) {
         throw new BaseException(
@@ -617,7 +618,7 @@ public final class DeltaUpdateTableMapper {
 
     // Normal path: the current schema already has column-mapping metadata.
 
-    // G6: at most one top-level rename per request.
+    // At most one top-level rename per request.
     List<TopLevelRename> topLevelRenames = detectTopLevelRenames(existingColumns, incomingColumns);
     if (topLevelRenames.size() > 1) {
       String renameList =
@@ -634,10 +635,9 @@ public final class DeltaUpdateTableMapper {
               + "]. Split them into separate ALTER statements.");
     }
 
-    // G7: defensive guard -- a "rename" where the new name is case-insensitively equal to the old
-    // name is a same-name rename (identical to the original). With the equalsIgnoreCase filter
-    // inside detectTopLevelRenames this branch is dead code in practice; it remains as a safety
-    // net in case detection logic changes.
+    // Defensive guard: reject a "rename" where the new name is case-insensitively equal to the
+    // old name. With the equalsIgnoreCase filter inside detectTopLevelRenames this branch is dead
+    // code in practice; it remains as a safety net in case detection logic changes.
     for (TopLevelRename rename : topLevelRenames) {
       if (rename.newLogicalName().equalsIgnoreCase(rename.oldLogicalName())) {
         throw new BaseException(
@@ -700,8 +700,8 @@ public final class DeltaUpdateTableMapper {
 
   /**
    * Returns {@code true} if any top-level incoming column lacks a {@code
-   * delta.columnMapping.physicalName} metadata entry. Used by the G3 guard to detect a first-enable
-   * request where a hidden rename cannot be safely ruled out.
+   * delta.columnMapping.physicalName} metadata entry. Used to detect a first-enable request where a
+   * hidden rename cannot be safely ruled out.
    */
   private static boolean hasAnyMissingPhysicalName(List<ColumnInfo> columns) {
     for (ColumnInfo c : columns) {
@@ -794,8 +794,8 @@ public final class DeltaUpdateTableMapper {
    * renames ride inside the column's {@code type_json} and are not surfaced here.
    *
    * <p>Case-insensitive name comparison: a change from "A" to "a" is not considered a rename
-   * (matching the DB UC TS-wrapper's {@code equalsIgnoreCase} filter). This is the reason G7 cannot
-   * be triggered in the current implementation.
+   * (matching the standard approach of treating case-only changes as non-renames). This filtering
+   * means the defensive same-name-rename check cannot be triggered in the current implementation.
    */
   private static List<TopLevelRename> detectTopLevelRenames(
       List<ColumnInfo> currentColumns, List<ColumnInfo> incomingColumns) {
@@ -911,7 +911,7 @@ public final class DeltaUpdateTableMapper {
         "id".equals(mode) ? "delta.columnMapping.id" : "delta.columnMapping.physicalName";
     String curValue = getCmKeyValue(curField, cmKey);
     String incValue = getCmKeyValue(incField, cmKey);
-    // Only flag when BOTH schemas carry the key (presence-only strip is handled by G5).
+    // Only flag when BOTH schemas carry the key (presence-only strip is handled separately).
     if (curValue != null && incValue != null && !curValue.equals(incValue)) {
       violations.add(fieldLabel);
     }
@@ -1097,7 +1097,8 @@ public final class DeltaUpdateTableMapper {
 
   /**
    * Returns {@code true} if {@code field}'s metadata contains {@code cmKey} OR any nested field in
-   * its type tree does. Used for the schema-wide G2 "has any active CM key" check.
+   * its type tree does. Used for the schema-wide check that detects whether the active CM key is
+   * present anywhere in the schema.
    */
   private static boolean hasCmKeyInField(DeltaStructField field, String cmKey) {
     if (hasCmKeyInFieldTopLevel(field, cmKey)) return true;
@@ -1123,7 +1124,8 @@ public final class DeltaUpdateTableMapper {
 
   /**
    * Returns {@code true} if any column in {@code columns} (at any nesting level) contains the given
-   * {@code cmKey} in its metadata. Used for the mode-specific G2 check.
+   * {@code cmKey} in its metadata. Used for the mode-specific check that rejects dropping the
+   * active mode's column-mapping key.
    */
   private static boolean hasCmKeyAnywhere(List<ColumnInfo> columns, String cmKey) {
     for (ColumnInfo col : columns) {

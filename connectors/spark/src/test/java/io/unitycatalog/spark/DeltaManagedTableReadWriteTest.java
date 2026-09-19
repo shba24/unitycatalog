@@ -307,9 +307,10 @@ public abstract class DeltaManagedTableReadWriteTest extends BaseTableReadWriteT
 
   @Test
   public void testAlterTableRenameColumnTopLevel() {
-    // WS2: the connector no longer rejects RENAME COLUMN — it delegates to Delta's DeltaCatalog.
-    // This exercises the same-session path (SELECT reads the Delta-log schema). Cross-session
-    // identity preservation on the OSS UC server is WS3's contract and is tested there.
+    // The connector delegates RENAME COLUMN to Delta's DeltaCatalog for execution.
+    // This test exercises the same-session path (SELECT reads the Delta-log schema). Cross-session
+    // identity preservation requires additional server-side Delta integration and is tested
+    // separately.
     session = createSparkSessionWithCatalogs(SPARK_CATALOG, CATALOG_NAME);
     ensureSparkCatalogSchemaExists();
     String fullTableName =
@@ -323,9 +324,9 @@ public abstract class DeltaManagedTableReadWriteTest extends BaseTableReadWriteT
 
   @Test
   public void testAlterTableRenameNestedStructField() {
-    // WS2: the connector no longer rejects RENAME COLUMN for nested struct fields — it delegates
-    // to Delta's DeltaCatalog. Same-session path only; cross-session identity preservation for
-    // nested fields on the OSS UC server is WS3's contract and is tested there.
+    // The connector delegates RENAME COLUMN for nested struct fields to Delta's DeltaCatalog.
+    // This test exercises the same-session path only. Cross-session identity preservation for
+    // nested fields requires additional server-side Delta integration and is tested separately.
     session = createSparkSessionWithCatalogs(SPARK_CATALOG, CATALOG_NAME);
     ensureSparkCatalogSchemaExists();
     String t =

@@ -1406,8 +1406,8 @@ public class SdkUpdateTableTest extends DeltaBaseTableCRUDTestEnv {
   /**
    * After a set-columns rename (logical "a" → "b", same physicalName "col-1"), the rename succeeds:
    * the new logical name is present, the old is gone, and physicalName is retained in the column's
-   * type_json metadata. DB-row UUIDs are regenerated on every set-columns (matching managed-catalog
-   * behaviour); no UUID-preservation assertion is made here.
+   * type_json metadata. Database row UUIDs are regenerated on every set-columns (standard catalog
+   * semantics); no UUID-preservation assertion is made here.
    */
   @Test
   public void testRenameColumnNameMode() throws Exception {
@@ -1425,10 +1425,10 @@ public class SdkUpdateTableTest extends DeltaBaseTableCRUDTestEnv {
 
   /**
    * set-columns that retains a column by logical name but strips its column-mapping identity key
-   * (present in the existing schema, absent in the incoming schema) must be rejected with {@code
-   * INVALID_ARGUMENT} (G5). Uses a two-column table: "a" retains its CM key, "b" loses it, so the
-   * incoming schema still has CM metadata overall (preventing the more general G2 from firing
-   * first). Only G5 fires, naming "b" as the offending column.
+   * (present in the existing schema, absent in the incoming schema) must be rejected. Uses a
+   * two-column table: "a" retains its CM key, "b" loses it, so the incoming schema still has CM
+   * metadata overall (preventing the full-CM-drop check from firing first). The identity-strip
+   * check fires for "b" as the offending column.
    */
   @Test
   public void testSetColumnsDroppingColumnMappingMetadataIsRejected() throws Exception {
@@ -1532,8 +1532,7 @@ public class SdkUpdateTableTest extends DeltaBaseTableCRUDTestEnv {
 
   /**
    * Verifies that an unknown {@code delta.columnMapping.mode} value (e.g. "foo") stored on a table
-   * causes the set-columns guard to reject the request with "Invalid column mapping mode", matching
-   * the TS wrapper's {@code getColumnMappingMode} rejection.
+   * causes the set-columns guard to reject the request with "Invalid column mapping mode".
    *
    * <p>The mode is seeded by setting the raw property via {@code set-properties} on an external
    * table (which accepts arbitrary properties), then sending {@code set-schema} — at that point the
@@ -1574,9 +1573,9 @@ public class SdkUpdateTableTest extends DeltaBaseTableCRUDTestEnv {
   }
 
   /**
-   * Comprehensive test for all column-mapping rename / drop / reassignment guards (G1-G8) and the
-   * support cases from the DB UC rename-column spec. Each section runs against a fresh table so
-   * guard tests can never interfere.
+   * Comprehensive test for all column-mapping validation guards and supported use cases. Each
+   * section runs against a fresh table so the test cases do not interfere with each other. Tests
+   * both supported scenarios (rename, drop, add, reorder) and rejection cases.
    */
   @Test
   public void testRenameColumnGuards() throws Exception {
@@ -1757,7 +1756,8 @@ public class SdkUpdateTableTest extends DeltaBaseTableCRUDTestEnv {
       Handle h = createTwoColCmNameModeManaged("tbl_guards_mixed_ops");
       DeltaStructFieldMetadata cMeta = new DeltaStructFieldMetadata();
       cMeta.put("delta.columnMapping.id", 1);
-      cMeta.put("delta.columnMapping.physicalName", "col-1"); // was "a"
+      cMeta.put(
+          "delta.columnMapping.physicalName", "col-1"); // old column "a" retains this physicalName
       DeltaStructFieldMetadata dMeta = new DeltaStructFieldMetadata();
       dMeta.put("delta.columnMapping.id", 5);
       dMeta.put("delta.columnMapping.physicalName", "col-5");
@@ -1841,8 +1841,8 @@ public class SdkUpdateTableTest extends DeltaBaseTableCRUDTestEnv {
       assertThat(r.getMetadata().getPartitionColumns()).containsExactly("b");
     }
 
-    // -------- G1: rename/drop without column mapping --------
-    // External (non-CM) table; send set-columns that removes "amount" → G1.
+    // -------- Reject: rename/drop without column mapping --------
+    // External (non-CM) table; send set-columns that removes "amount" without CM metadata.
     {
       Handle h = createDeltaExternal("tbl_guards_g1");
       TestUtils.assertDeltaApiException(
@@ -1864,8 +1864,8 @@ public class SdkUpdateTableTest extends DeltaBaseTableCRUDTestEnv {
           "Column mapping is required to rename or drop a column");
     }
 
-    // -------- G2: drop active id key (id-mode table keeps physicalName, drops id) --------
-    // id-mode table; incoming schema keeps physicalName but drops delta.columnMapping.id → G2.
+    // -------- Reject: drop active mode key (id-mode table keeps physicalName, drops id) --------
+    // id-mode table; incoming schema keeps physicalName but drops delta.columnMapping.id.
     {
       Handle h = createCmIdModeManaged("tbl_guards_g2_id_mode");
       DeltaStructFieldMetadata physOnly = new DeltaStructFieldMetadata();
@@ -1890,7 +1890,7 @@ public class SdkUpdateTableTest extends DeltaBaseTableCRUDTestEnv {
     }
 
     // -----
-    // name-mode table; incoming schema keeps id but drops delta.columnMapping.physicalName → G2.
+    // name-mode table; incoming schema keeps id but drops delta.columnMapping.physicalName.
     {
       Handle h = createCmNameModeManaged("tbl_guards_g2_name_mode");
       DeltaStructFieldMetadata idOnly = new DeltaStructFieldMetadata();
@@ -1914,8 +1914,8 @@ public class SdkUpdateTableTest extends DeltaBaseTableCRUDTestEnv {
           "dropped column mapping metadata");
     }
 
-    // -------- G2: drop ALL column mapping metadata --------
-    // CM table; send set-columns with a column that has NO CM metadata at all → G2.
+    // -------- Reject: drop ALL column mapping metadata --------
+    // CM table; send set-columns with a column that has NO CM metadata at all.
     {
       Handle h = createCmNameModeManaged("tbl_guards_g2");
       TestUtils.assertDeltaApiException(
@@ -1937,9 +1937,9 @@ public class SdkUpdateTableTest extends DeltaBaseTableCRUDTestEnv {
           "dropped column mapping metadata");
     }
 
-    // -------- G3: first-enable missing physicalName --------
-    // Non-CM table; incoming enables CM (has id) but at least one column omits physicalName → G3.
-    // Each column gets a distinct id to avoid triggering G8 (duplicate-id guard) first.
+    // -------- Reject: first-enable missing physicalName --------
+    // Non-CM table; incoming enables CM (has id) but at least one column omits physicalName.
+    // Each column gets a distinct id to avoid triggering the duplicate-id guard first.
     {
       Handle h = createDeltaExternal("tbl_guards_g3");
       DeltaStructFieldMetadata idMeta = new DeltaStructFieldMetadata();
@@ -1970,7 +1970,7 @@ public class SdkUpdateTableTest extends DeltaBaseTableCRUDTestEnv {
           "physical column name");
     }
 
-    // -------- G4: first-enable + rename in one request --------
+    // -------- Reject: first-enable + rename in one request --------
     // Non-CM table; incoming enables CM AND renames "amount" → "revenue" in the same request.
     {
       Handle h = createDeltaExternal("tbl_guards_g4");
@@ -2007,7 +2007,7 @@ public class SdkUpdateTableTest extends DeltaBaseTableCRUDTestEnv {
           "separate statement");
     }
 
-    // -------- G6: more than one top-level rename in one request (name-mode) --------
+    // -------- Reject: more than one top-level rename in one request (name-mode) --------
     {
       Handle h = createTwoColCmNameModeManaged("tbl_guards_g6");
       DeltaStructFieldMetadata cMeta = new DeltaStructFieldMetadata();
@@ -2040,7 +2040,7 @@ public class SdkUpdateTableTest extends DeltaBaseTableCRUDTestEnv {
           "single top-level column rename");
     }
 
-    // -------- G8: duplicate CM id in incoming schema (id-mode) --------
+    // -------- Reject: duplicate CM id in incoming schema (id-mode) --------
     {
       Handle h = createCmIdModeManaged("tbl_guards_g8");
       DeltaStructFieldMetadata dupMeta = new DeltaStructFieldMetadata();
@@ -2070,9 +2070,10 @@ public class SdkUpdateTableTest extends DeltaBaseTableCRUDTestEnv {
           "Duplicate column mapping id");
     }
 
-    // -------- G5 mode-specific: name-mode retained column drops physicalName (keeps id) --------
+    // -------- Reject: mode-specific CM key stripped (name-mode drops physicalName, keeps id)
+    // --------
     // name-mode table (active key = physicalName); two-column table: send "a" with physicalName
-    // intact but "b" with physicalName stripped (only id kept) → G5 fires for "b".
+    // intact but "b" with physicalName stripped (only id kept).
     {
       Handle h = createTwoColCmNameModeManaged("tbl_guards_g5_name_mode");
       DeltaStructFieldMetadata aOk = new DeltaStructFieldMetadata();
@@ -2104,11 +2105,11 @@ public class SdkUpdateTableTest extends DeltaBaseTableCRUDTestEnv {
           "set-columns dropped column mapping metadata for column(s): b");
     }
 
-    // -------- G4: first-enable + NESTED rename → rejected --------
+    // -------- Reject: first-enable + NESTED rename in one request --------
     // Current table: top-level "s" is a struct column containing nested field "x" (no CM at all).
     // Incoming enables CM on "s" (physicalName "s" == current name: no outer rename) and
     // introduces nested "y" with physicalName "x" (matches current nested "x"): nested rename.
-    // Wrapper rejects: first-enable + nested rename in a single request.
+    // First-enable + nested rename in a single request is not supported.
     {
       Handle h = createSimpleStructExternal("tbl_guards_g4_nested");
       // Outer column "s": physicalName "s" (no rename, matches current "s").
@@ -2761,8 +2762,8 @@ public class SdkUpdateTableTest extends DeltaBaseTableCRUDTestEnv {
 
   /**
    * Creates an EXTERNAL Delta table with a single top-level struct column "s" containing a nested
-   * field "x" (long, no CM metadata on either field). Used to test G4 nested rename detection on
-   * the first-enable path.
+   * field "x" (long, no CM metadata on either field). Used to test nested rename detection on the
+   * first-enable path.
    */
   private Handle createSimpleStructExternal(String tableName) throws Exception {
     String location =
@@ -2919,7 +2920,7 @@ public class SdkUpdateTableTest extends DeltaBaseTableCRUDTestEnv {
 
   /**
    * Builds a {@code set-columns} update for column {@code colName} with its column-mapping metadata
-   * stripped (empty metadata). Used by the Task 2 strip-guard test.
+   * stripped (empty metadata). Used by the test that verifies stripping CM keys is rejected.
    */
   private static DeltaSetSchemaUpdate setColumnsWithoutMappingMetadataFor(String colName) {
     return new DeltaSetSchemaUpdate()
