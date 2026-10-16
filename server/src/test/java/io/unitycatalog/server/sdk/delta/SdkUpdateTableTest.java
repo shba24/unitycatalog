@@ -1808,10 +1808,10 @@ public class SdkUpdateTableTest extends DeltaBaseTableCRUDTestEnv {
           .isEqualTo("double");
     }
 
-    // -------- Support: partition-column rename (send set-partition-columns with new name) --------
+    // -------- Support: partition-column rename with explicit set-partition-columns --------
     // Rename "a"→"b" (same physicalName) AND send set-partition-columns(["b"]); should succeed.
     {
-      Handle h = createCmNameModeManaged("tbl_guards_part_rename");
+      Handle h = createCmNameModeManaged("tbl_guards_part_rename_explicit");
       // First make "a" a partition column.
       Handle h1 =
           h.withEtag(
@@ -1839,6 +1839,111 @@ public class SdkUpdateTableTest extends DeltaBaseTableCRUDTestEnv {
               new DeltaSetPartitionColumnsUpdate().partitionColumns(List.of("b")));
       assertThat(columnNames(r)).containsExactly("b");
       assertThat(r.getMetadata().getPartitionColumns()).containsExactly("b");
+    }
+
+    // -------- Support: partition-column rename resolved by physicalName (no explicit
+    // set-partition-columns) --------
+    // Partition on "a" (physicalName "col-1"); rename "a"→"b" (same physicalName);
+    // set-partition-columns is ABSENT. The mapper resolves "a" to "b" by physicalName match.
+    {
+      Handle h = createCmNameModeManaged("tbl_guards_part_rename_implicit_name_mode");
+      // First make "a" a partition column.
+      Handle h1 =
+          h.withEtag(
+              updateTable(h, new DeltaSetPartitionColumnsUpdate().partitionColumns(List.of("a")))
+                  .getMetadata()
+                  .getEtag());
+      // Now rename "a" → "b" WITHOUT sending set-partition-columns.
+      DeltaStructFieldMetadata meta = new DeltaStructFieldMetadata();
+      meta.put("delta.columnMapping.id", 1);
+      meta.put("delta.columnMapping.physicalName", "col-1"); // same physicalName
+      DeltaLoadTableResponse r =
+          updateTable(
+              h1,
+              new DeltaSetSchemaUpdate()
+                  .columns(
+                      new DeltaStructType()
+                          .type("struct")
+                          .fields(
+                              List.of(
+                                  new DeltaStructField()
+                                      .name("b")
+                                      .type(new DeltaPrimitiveType().type("long"))
+                                      .nullable(false)
+                                      .metadata(meta)))));
+      assertThat(columnNames(r)).containsExactly("b");
+      // The partition should have followed the rename to "b".
+      assertThat(r.getMetadata().getPartitionColumns()).containsExactly("b");
+    }
+
+    // -------- Support: partition-column rename resolved by id (id-mode, no explicit
+    // set-partition-columns) --------
+    // Partition on "a" (id=1); rename "a"→"b" (same id=1); set-partition-columns is ABSENT.
+    // The mapper resolves "a" to "b" by id match.
+    {
+      Handle h = createCmIdModeManaged("tbl_guards_part_rename_implicit_id_mode");
+      // First make "a" a partition column.
+      Handle h1 =
+          h.withEtag(
+              updateTable(h, new DeltaSetPartitionColumnsUpdate().partitionColumns(List.of("a")))
+                  .getMetadata()
+                  .getEtag());
+      // Now rename "a" → "b" WITHOUT sending set-partition-columns.
+      DeltaStructFieldMetadata meta = new DeltaStructFieldMetadata();
+      meta.put("delta.columnMapping.id", 1); // same id
+      meta.put("delta.columnMapping.physicalName", "col-1");
+      DeltaLoadTableResponse r =
+          updateTable(
+              h1,
+              new DeltaSetSchemaUpdate()
+                  .columns(
+                      new DeltaStructType()
+                          .type("struct")
+                          .fields(
+                              List.of(
+                                  new DeltaStructField()
+                                      .name("b")
+                                      .type(new DeltaPrimitiveType().type("long"))
+                                      .nullable(false)
+                                      .metadata(meta)))));
+      assertThat(columnNames(r)).containsExactly("b");
+      // The partition should have followed the rename to "b".
+      assertThat(r.getMetadata().getPartitionColumns()).containsExactly("b");
+    }
+
+    // -------- Reject: partition-column dropped (no physical identity match) --------
+    // Partition on "a" (id=1, physicalName "col-1"); drop "a"; send set-columns with different
+    // column. No set-partition-columns sent. Mapper resolves "a" by id/physicalName: cannot find
+    // it in new schema → reject with "partition column dropped".
+    {
+      Handle h = createCmNameModeManaged("tbl_guards_part_drop");
+      // First make "a" a partition column.
+      Handle h1 =
+          h.withEtag(
+              updateTable(h, new DeltaSetPartitionColumnsUpdate().partitionColumns(List.of("a")))
+                  .getMetadata()
+                  .getEtag());
+      // Now try to drop "a" by sending a new column without "a".
+      DeltaStructFieldMetadata newMeta = new DeltaStructFieldMetadata();
+      newMeta.put("delta.columnMapping.id", 2); // different id
+      newMeta.put("delta.columnMapping.physicalName", "col-2");
+      TestUtils.assertDeltaApiException(
+          () ->
+              updateTable(
+                  h1,
+                  new DeltaSetSchemaUpdate()
+                      .columns(
+                          new DeltaStructType()
+                              .type("struct")
+                              .fields(
+                                  List.of(
+                                      new DeltaStructField()
+                                          .name("c")
+                                          .type(new DeltaPrimitiveType().type("string"))
+                                          .nullable(true)
+                                          .metadata(newMeta))))),
+          DeltaErrorType.INVALID_PARAMETER_VALUE_EXCEPTION,
+          "partition column");
     }
 
     // -------- Reject: rename/drop without column mapping --------
