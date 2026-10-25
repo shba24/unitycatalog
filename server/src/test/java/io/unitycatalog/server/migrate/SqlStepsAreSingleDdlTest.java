@@ -9,7 +9,6 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.stream.Stream;
 import org.flywaydb.core.api.MigrationVersion;
 import org.junit.jupiter.api.Test;
@@ -17,21 +16,18 @@ import org.junit.jupiter.api.Test;
 /**
  * Every SQL step of every database holds one DDL statement, so a step either applies whole or not
  * at all, and data changes go in Java steps. A step without statements (a version that changes
- * nothing on that database) is allowed. Every check ({@code checks/<db>/C<version>__*.sql}) holds
- * one query and belongs to the step of its version in {@code <db>}.
+ * nothing on that database) is allowed. The first step, the 0.7 baseline, builds the whole schema
+ * at once; later baselines are Flyway baseline migrations ({@code B<version>__*.sql}, next to the
+ * steps, run only on a new database), which this test does not read. Every check ({@code
+ * checks/<db>/C<version>__*.sql}) holds one query and belongs to the step of its version in {@code
+ * <db>}.
  */
 public class SqlStepsAreSingleDdlTest {
 
   private static final Path STEPS = Path.of("server/src/main/resources/db/migration");
   private static final Path CHECKS = STEPS.resolve("checks");
 
-  /** Steps that hold more than one statement, with the reason. */
-  private static final Map<String, String> EXEMPT =
-      Map.of(
-          "h2/V1__baseline_0_7.sql", "the baseline: the whole schema at once",
-          "postgresql/V1__baseline_0_7.sql", "the baseline: the whole schema at once",
-          "mysql/V1__baseline_0_7.sql", "the baseline: the whole schema at once",
-          "mysql/V3__case_sensitive_text.sql", "converts every table; safe to repeat");
+  private static final String BASELINE = "V1__baseline_0_7.sql";
 
   private static final List<String> DDL = List.of("CREATE", "ALTER", "DROP", "RENAME");
 
@@ -45,7 +41,7 @@ public class SqlStepsAreSingleDdlTest {
     assertThat(steps).isNotEmpty();
     for (Path step : steps) {
       String name = STEPS.relativize(step).toString().replace('\\', '/');
-      if (EXEMPT.containsKey(name)) {
+      if (step.getFileName().toString().equals(BASELINE)) {
         continue;
       }
       List<String> statements = statements(Files.readString(step));

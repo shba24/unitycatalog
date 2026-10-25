@@ -1,11 +1,11 @@
 package io.unitycatalog.server.migrate;
 
-import static io.unitycatalog.server.migrate.MigratorTest.execute;
-import static io.unitycatalog.server.migrate.MigratorTest.quote;
+import static io.unitycatalog.server.migrate.UpgradeTestUtils.execute;
+import static io.unitycatalog.server.migrate.UpgradeTestUtils.identifierQuote;
+import static io.unitycatalog.server.migrate.UpgradeTestUtils.kind;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import io.unitycatalog.server.migrate.SchemaMigrator.MigrationOutcome;
 import io.unitycatalog.server.migrate.teststeps.batched.V2001__Fill_upper_name_in_batches;
 import io.unitycatalog.server.testdatabase.TempDatabase;
 import io.unitycatalog.server.testdatabase.TestDatabase;
@@ -55,14 +55,14 @@ public class DataStepTest {
 
   @Test
   void fillsEveryRowInOneTransaction() throws SQLException {
-    assertThat(migrate(IN_ONE_TRANSACTION)).isEqualTo(new MigrationOutcome("2000", "2001", 1));
+    assertThat(migrate(IN_ONE_TRANSACTION)).isOne();
 
     assertThat(filledRows()).isEqualTo(ROWS);
   }
 
   @Test
   void fillsEveryRowInBatches() throws SQLException {
-    assertThat(migrate(IN_BATCHES)).isEqualTo(new MigrationOutcome("2000", "2001", 1));
+    assertThat(migrate(IN_BATCHES)).isOne();
 
     assertThat(filledRows()).isEqualTo(ROWS);
   }
@@ -72,7 +72,7 @@ public class DataStepTest {
     migrate(IN_BATCHES);
     execute(db, "UPDATE test_data_step_items SET upper_name = NULL WHERE id = 1");
 
-    assertThat(migrate(IN_BATCHES).applied()).isZero();
+    assertThat(migrate(IN_BATCHES)).isZero();
     assertThat(filledRows()).isEqualTo(ROWS - 1);
   }
 
@@ -80,7 +80,7 @@ public class DataStepTest {
   void stepAlreadyDoneIsRecordedWithoutRunning() throws SQLException {
     execute(db, "UPDATE test_data_step_items SET upper_name = 'by hand'");
 
-    assertThat(migrate(IN_ONE_TRANSACTION)).isEqualTo(new MigrationOutcome("2000", "2001", 1));
+    assertThat(migrate(IN_ONE_TRANSACTION)).isOne();
     assertThat(filledRows()).isZero();
     assertThat(historyRows("2001")).isOne();
   }
@@ -100,22 +100,21 @@ public class DataStepTest {
     // Every database records the failed step (it ran outside a transaction), which a rerun refuses
     // until Flyway's repair removes it.
     flyway(IN_BATCHES).repair();
-    assertThat(migrate(IN_BATCHES)).isEqualTo(new MigrationOutcome("2000", "2001", 1));
+    assertThat(migrate(IN_BATCHES)).isOne();
     assertThat(filledRows()).isEqualTo(ROWS);
     assertThat(historyRows("2001")).isOne();
   }
 
   /** Migrates with the release steps, the table step and the given steps. */
-  private MigrationOutcome migrate(String... steps) {
-    try (SchemaMigrator migrator =
-        new SchemaMigrator(db.dataSource(), db.kind(), locations(steps))) {
+  private int migrate(String... steps) {
+    try (SchemaMigrator migrator = new SchemaMigrator(db.dataSource(), locations(steps))) {
       return migrator.migrate();
     }
   }
 
   private Flyway flyway(String... steps) {
     List<String> locations = locations(steps);
-    locations.add(0, "classpath:db/migration/" + db.kind().folder());
+    locations.add(0, "classpath:db/migration/" + kind(db).folder());
     locations.add(1, SchemaMigrator.JAVA_STEPS);
     return Flyway.configure()
         .dataSource(db.dataSource())
@@ -126,7 +125,7 @@ public class DataStepTest {
 
   private List<String> locations(String... steps) {
     List<String> locations = new ArrayList<>();
-    locations.add(CREATE_TABLE + db.kind().folder());
+    locations.add(CREATE_TABLE + kind(db).folder());
     locations.addAll(List.of(steps));
     return locations;
   }
@@ -139,7 +138,7 @@ public class DataStepTest {
   private int historyRows(String version) throws SQLException {
     return count(
         "SELECT COUNT(*) FROM %1$suc_schema_history%1$s WHERE %1$sversion%1$s = '%2$s'"
-            .formatted(quote(db), version));
+            .formatted(identifierQuote(db.dataSource()), version));
   }
 
   private int count(String sql) throws SQLException {

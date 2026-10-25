@@ -1,4 +1,4 @@
-package io.unitycatalog.server.migrate.kit;
+package io.unitycatalog.server.migrate;
 
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
@@ -9,7 +9,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
-import java.util.stream.Collectors;
 import javax.sql.DataSource;
 
 /**
@@ -20,7 +19,7 @@ import javax.sql.DataSource;
  * Names are lower-cased; CHECK clauses keep their case, since enum literals in them are
  * case-sensitive. Casbin's rule table and Unity Catalog's schema history table are left out.
  */
-public record SchemaSnapshot(List<String> entries) {
+record SchemaSnapshot(List<String> entries) {
 
   private static final Set<String> IGNORED_TABLES = Set.of("casbin_rule", "uc_schema_history");
 
@@ -43,17 +42,12 @@ public record SchemaSnapshot(List<String> entries) {
       where con.contype = 'c' and n.nspname = current_schema()
       """;
 
-  public static SchemaSnapshot of(DataSource dataSource) {
+  static SchemaSnapshot of(DataSource dataSource) {
     try (Connection connection = dataSource.getConnection()) {
       return read(connection);
     } catch (SQLException e) {
       throw new IllegalStateException("Could not read the schema", e);
     }
-  }
-
-  /** One entry per line, in sorted order, ending with a newline: the recorded schema dumps. */
-  public String render() {
-    return entries.stream().map(entry -> entry + "\n").collect(Collectors.joining());
   }
 
   private static SchemaSnapshot read(Connection connection) throws SQLException {
@@ -120,11 +114,10 @@ public record SchemaSnapshot(List<String> entries) {
 
   private static List<String> checks(Connection connection) throws SQLException {
     String query =
-        switch (connection.getMetaData().getDatabaseProductName()) {
-          case "H2" -> STANDARD_CHECKS.formatted("current_schema");
-          case "MySQL" -> STANDARD_CHECKS.formatted("database()");
-          case "PostgreSQL" -> POSTGRES_CHECKS;
-          default -> throw new IllegalStateException("No CHECK constraint query for this database");
+        switch (SchemaMigrator.DatabaseKind.fromJdbcUrl(connection.getMetaData().getURL())) {
+          case H2 -> STANDARD_CHECKS.formatted("current_schema");
+          case MYSQL -> STANDARD_CHECKS.formatted("database()");
+          case POSTGRESQL -> POSTGRES_CHECKS;
         };
     List<String> checks = new ArrayList<>();
     try (Statement statement = connection.createStatement();

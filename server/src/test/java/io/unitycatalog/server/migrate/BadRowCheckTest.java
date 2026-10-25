@@ -1,11 +1,11 @@
 package io.unitycatalog.server.migrate;
 
-import static io.unitycatalog.server.migrate.MigratorTest.execute;
+import static io.unitycatalog.server.migrate.UpgradeTestUtils.execute;
+import static io.unitycatalog.server.migrate.UpgradeTestUtils.history;
+import static io.unitycatalog.server.migrate.UpgradeTestUtils.kind;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import io.unitycatalog.server.migrate.SchemaMigrator.MigrationOutcome;
-import io.unitycatalog.server.migrate.kit.SchemaSnapshot;
 import io.unitycatalog.server.testdatabase.TempDatabase;
 import io.unitycatalog.server.testdatabase.TestDatabase;
 import java.io.ByteArrayOutputStream;
@@ -32,7 +32,7 @@ public class BadRowCheckTest {
     createItems("a", "a", "b");
     SchemaMigrator migrator = migrator(CREATE_TABLE, UNIQUE_NAMES);
     SchemaSnapshot before = SchemaSnapshot.of(db.dataSource());
-    List<String> history = history(migrator);
+    List<String> history = history(db);
 
     assertThatThrownBy(migrator::migrate)
         .isInstanceOf(IllegalStateException.class)
@@ -45,7 +45,7 @@ public class BadRowCheckTest {
                 + "Fix them as docs/server/upgrades.md shows (section \"Rows that block an"
                 + " upgrade\"), then start the server again.");
     assertThat(SchemaSnapshot.of(db.dataSource())).isEqualTo(before);
-    assertThat(history(migrator)).isEqualTo(history);
+    assertThat(history(db)).isEqualTo(history);
     assertThat(migrator.currentVersion()).isEqualTo("3000");
   }
 
@@ -54,8 +54,10 @@ public class BadRowCheckTest {
     createItems("a", "a", "b");
     execute(db, "DELETE FROM test_named_items WHERE id = 2");
 
-    assertThat(migrator(CREATE_TABLE, UNIQUE_NAMES).migrate())
-        .isEqualTo(new MigrationOutcome("3000", "3001", 1));
+    SchemaMigrator migrator = migrator(CREATE_TABLE, UNIQUE_NAMES);
+
+    assertThat(migrator.migrate()).isOne();
+    assertThat(migrator.currentVersion()).isEqualTo("3001");
   }
 
   @Test
@@ -73,7 +75,7 @@ public class BadRowCheckTest {
     createItems("a", "a", "b");
     SchemaMigrator migrator = migrator(CREATE_TABLE, UNIQUE_NAMES);
     SchemaSnapshot before = SchemaSnapshot.of(db.dataSource());
-    List<String> history = history(migrator);
+    List<String> history = history(db);
     ByteArrayOutputStream out = new ByteArrayOutputStream();
 
     assertThat(migrator.checkSchema(new PrintStream(out, true, StandardCharsets.UTF_8))).isOne();
@@ -81,7 +83,7 @@ public class BadRowCheckTest {
         .contains("Check 3001 (unique test named item names) found 2 rows:\n")
         .contains("  id=1, name=a\n  id=2, name=a\n");
     assertThat(SchemaSnapshot.of(db.dataSource())).isEqualTo(before);
-    assertThat(history(migrator)).isEqualTo(history);
+    assertThat(history(db)).isEqualTo(history);
   }
 
   @Test
@@ -96,7 +98,11 @@ public class BadRowCheckTest {
 
   @Test
   void runsNoCheckOnAnEmptyDatabase() {
-    assertThat(migrator(CREATE_TABLE, UNIQUE_NAMES).migrate().to()).isEqualTo("3001");
+    SchemaMigrator migrator = migrator(CREATE_TABLE, UNIQUE_NAMES);
+
+    migrator.migrate();
+
+    assertThat(migrator.currentVersion()).isEqualTo("3001");
   }
 
   /** Migrates to version 3000 and inserts an item per name, numbered from 1. */
@@ -111,12 +117,6 @@ public class BadRowCheckTest {
 
   private SchemaMigrator migrator(String... steps) {
     return new SchemaMigrator(
-        db.dataSource(),
-        db.kind(),
-        List.of(steps).stream().map(s -> s + db.kind().folder()).toList());
-  }
-
-  private static List<String> history(SchemaMigrator migrator) {
-    return migrator.applied().stream().map(m -> m.getVersion() + " " + m.getState()).toList();
+        db.dataSource(), List.of(steps).stream().map(s -> s + kind(db).folder()).toList());
   }
 }

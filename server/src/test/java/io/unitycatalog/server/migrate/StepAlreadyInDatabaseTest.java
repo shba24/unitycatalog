@@ -1,12 +1,13 @@
 package io.unitycatalog.server.migrate;
 
-import static io.unitycatalog.server.migrate.MigratorTest.execute;
+import static io.unitycatalog.server.migrate.UpgradeTestUtils.execute;
+import static io.unitycatalog.server.migrate.UpgradeTestUtils.history;
+import static io.unitycatalog.server.migrate.UpgradeTestUtils.kind;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.unitycatalog.server.migrate.SchemaMigrator.DatabaseKind;
-import io.unitycatalog.server.migrate.SchemaMigrator.MigrationOutcome;
 import io.unitycatalog.server.migrate.SchemaMigrator.SchemaState;
 import io.unitycatalog.server.testdatabase.TempDatabase;
 import io.unitycatalog.server.testdatabase.TestDatabase;
@@ -20,8 +21,6 @@ import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
 import javax.sql.DataSource;
-import org.flywaydb.core.api.MigrationInfo;
-import org.flywaydb.core.api.MigrationState;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -67,12 +66,12 @@ public class StepAlreadyInDatabaseTest {
     String latest = migrator.latestVersion();
     int steps = Integer.parseInt(latest) - 4000;
 
-    assertThat(migrator.migrate()).isEqualTo(new MigrationOutcome("4000", latest, steps));
+    assertThat(migrator.migrate()).isEqualTo(steps);
     String version = step.substring(1, step.indexOf("__"));
-    assertThat(migrator.applied())
-        .filteredOn(m -> m.getVersion().getVersion().equals(version))
-        .extracting(MigrationInfo::getState)
-        .containsExactly(MigrationState.SUCCESS);
+    assertThat(history(db))
+        .filteredOn(row -> row.startsWith(version + " "))
+        .singleElement()
+        .satisfies(row -> assertThat(row).endsWith(" true"));
     assertThat(sent).doesNotContain(statement(step));
   }
 
@@ -101,7 +100,7 @@ public class StepAlreadyInDatabaseTest {
 
   @Test
   void runsAStepThatDropsTheSizeOfAType() {
-    assumeTrue(db.kind() != DatabaseKind.MYSQL);
+    assumeTrue(kind(db) != DatabaseKind.MYSQL);
     migrator(db.dataSource(), BASE).migrate();
     List<String> sent = new ArrayList<>();
 
@@ -124,7 +123,7 @@ public class StepAlreadyInDatabaseTest {
   /** MySQL's {@code MODIFY} restates the whole column: without {@code DEFAULT}, it drops one. */
   @Test
   void runsAModifyThatDropsTheColumnsDefault() {
-    assumeTrue(db.kind() == DatabaseKind.MYSQL);
+    assumeTrue(kind(db) == DatabaseKind.MYSQL);
     migrator(db.dataSource(), BASE).migrate();
     execute(db, "ALTER TABLE test_repeat_items MODIFY COLUMN label varchar(255) NULL DEFAULT 'x'");
     List<String> sent = new ArrayList<>();
@@ -136,24 +135,21 @@ public class StepAlreadyInDatabaseTest {
 
   @Test
   void adoptsA07DatabaseWhoseWideningIsAlreadyThere() {
-    MigratorTest.create07Schema(db);
+    UpgradeTestUtils.create07Schema(db);
     String widening = statement("db/migration/", "V2__widen_function_param_type_json.sql");
     execute(db, widening);
     List<String> sent = new ArrayList<>();
-    SchemaMigrator migrator = new SchemaMigrator(recording(sent), db.kind());
+    SchemaMigrator migrator = new SchemaMigrator(recording(sent));
 
-    assertThat(migrator.migrate())
-        .isEqualTo(
-            new MigrationOutcome(
-                "1", migrator.latestVersion(), MigratorTest.releaseSteps(migrator) - 1));
-    assertThat(migrator.applied().get(0).getType().isBaseline()).isTrue();
+    assertThat(migrator.migrate()).isEqualTo(MigratorTest.releaseSteps(migrator) - 1);
+    assertThat(history(db).get(0)).startsWith("1 BASELINE ");
     assertThat(migrator.state()).isEqualTo(SchemaState.CURRENT);
     assertThat(sent).doesNotContain(widening);
   }
 
   private SchemaMigrator migrator(DataSource dataSource, String... steps) {
     return new SchemaMigrator(
-        dataSource, db.kind(), List.of(steps).stream().map(s -> s + db.kind().folder()).toList());
+        dataSource, List.of(steps).stream().map(s -> s + kind(db).folder()).toList());
   }
 
   /** The one statement of a test-only step of this database, as Flyway sends it. */
@@ -163,7 +159,7 @@ public class StepAlreadyInDatabaseTest {
 
   /** The one statement of the step {@code step} of this database under {@code base}. */
   private String statement(String base, String step) {
-    String path = base + db.kind().folder() + "/" + step;
+    String path = base + kind(db).folder() + "/" + step;
     try (InputStream in = getClass().getClassLoader().getResourceAsStream(path)) {
       return new String(in.readAllBytes(), StandardCharsets.UTF_8).strip().replaceAll(";$", "");
     } catch (IOException e) {
