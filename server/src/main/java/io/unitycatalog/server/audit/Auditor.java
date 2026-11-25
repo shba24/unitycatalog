@@ -12,6 +12,8 @@ import io.unitycatalog.server.utils.NormalizedURL;
 import io.unitycatalog.server.utils.ServerProperties;
 import java.lang.reflect.InvocationTargetException;
 import java.net.URI;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.Optional;
@@ -99,7 +101,7 @@ public final class Auditor implements AutoCloseable {
         () ->
             base(AuditRecord.Action.ISSUE_CREDENTIAL, use.getPurpose())
                 .resourceId(use.getResourceId())
-                .location(sanitizeLocation(path.toString()))
+                .location(sanitizeLocation(path))
                 .access(
                     privileges.contains(CredentialContext.Privilege.UPDATE)
                         ? AuditRecord.Access.READ_WRITE
@@ -115,14 +117,17 @@ public final class Auditor implements AutoCloseable {
    * Keeps scheme, authority and path, so query strings, fragments and user info (which can carry
    * secrets) never reach a sink. ABFS keeps its {@code container@account} authority, with anything
    * before the {@code @} that is not a container name replaced by {@code [REDACTED]}. A location
-   * that can't be parsed is logged and left out of the record.
+   * that can't be parsed is logged and left out of the record. The path is the stored literal path.
    */
-  String sanitizeLocation(String url) {
+  String sanitizeLocation(NormalizedURL location) {
     try {
-      URI uri = URI.create(url);
+      URI uri = location.toUri();
       String authority = uri.getRawAuthority();
-      // Vending reads the decoded authority, so an encoded @ also ends user info.
-      String decoded = uri.getAuthority();
+      // The stored authority is literal text, but an encoded @ in it may still hide user info.
+      String decoded =
+          uri.getAuthority() == null
+              ? null
+              : URLDecoder.decode(uri.getAuthority(), StandardCharsets.UTF_8);
       if (decoded != null && decoded.contains("@")) {
         int at = decoded.lastIndexOf('@');
         String host = decoded.substring(at + 1);
@@ -135,7 +140,7 @@ public final class Auditor implements AutoCloseable {
           authority = "[REDACTED]@" + host;
         }
       }
-      String path = uri.getRawPath() == null ? "" : uri.getRawPath();
+      String path = uri.getPath() == null ? "" : uri.getPath();
       return uri.getScheme() + "://" + (authority == null ? "" : authority) + path;
     } catch (RuntimeException e) {
       // Neither the URL nor the exception is logged: a string that can't be parsed may still hold
