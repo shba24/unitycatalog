@@ -1120,6 +1120,22 @@ public class SchemaMigratorTest {
   }
 
   @Test
+  void refusesH2DomainConstraintHoldingV17NameBeforeAnyStep() {
+    org.junit.jupiter.api.Assumptions.assumeTrue(db.jdbcUrl().startsWith("jdbc:h2:"));
+    UpgradeTestUtils.execute(
+        db,
+        "CREATE DOMAIN other_app_type AS INT CONSTRAINT uc_functions_data_type_range"
+            + " CHECK (VALUE > 0)");
+    SchemaMigrator migrator = new SchemaMigrator(db.dataSource());
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    int check = migrator.checkSchema(new PrintStream(out, true, StandardCharsets.UTF_8));
+    assertThat(check).as("checkSchema output: " + out).isOne();
+    assertThatThrownBy(migrator::upgradeSchema)
+        .hasMessageContaining("uc_functions_data_type_range");
+    assertThat(migrator.state()).isEqualTo(SchemaState.EMPTY);
+  }
+
+  @Test
   void dropRangeCheckHandlesRenamedCheckConstraint() throws SQLException {
     UpgradeTestUtils.migrateTo(db, "16");
     DatabaseKind kind = DatabaseKind.of(db.dataSource());
