@@ -1149,6 +1149,48 @@ public class SchemaMigratorTest {
         .isEqualTo(UpgradeTestUtils.freshInstallSnapshot());
   }
 
+  @ParameterizedTest
+  @CsvSource({
+    "uc_functions, data_type, uc_functions_data_type_range, new"
+        + " V18__drop_old_function_data_type_check",
+    "uc_function_params, type_name, uc_function_params_type_name_range, new"
+        + " V20__drop_old_function_param_type_name_check",
+  })
+  void refusesBeforeAnyStepWhenRenamedOldCheckHoldsReplacementName(
+      String table, String column, String replacementName, String dropper) throws SQLException {
+    UpgradeTestUtils.migrateTo(db, "16");
+    DropRangeCheckMigration drop =
+        dropper.contains("V18")
+            ? new V18__drop_old_function_data_type_check()
+            : new V20__drop_old_function_param_type_name_check();
+    try (Connection conn = db.dataSource().getConnection()) {
+      drop.migrate(
+          new org.flywaydb.core.api.migration.Context() {
+            @Override
+            public org.flywaydb.core.api.configuration.Configuration getConfiguration() {
+              return null;
+            }
+
+            @Override
+            public Connection getConnection() {
+              return conn;
+            }
+          });
+    }
+    // The old 0..21 check, repaired under the name the replacement step will add.
+    UpgradeTestUtils.execute(
+        db,
+        "ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s BETWEEN 0 AND 21)"
+            .formatted(table, replacementName, column));
+
+    SchemaMigrator migrator = new SchemaMigrator(db.dataSource());
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    assertThat(migrator.checkSchema(new PrintStream(out, true, StandardCharsets.UTF_8))).isOne();
+    assertThatThrownBy(migrator::upgradeSchema).isInstanceOf(IllegalStateException.class);
+    // Refused before any step ran: still at 16, not half way.
+    assertThat(migrator.recordedVersion()).isEqualTo("16");
+  }
+
   @Test
   void dropRangeCheckRefusesZeroMatches() throws SQLException {
     new SchemaMigrator(db.dataSource()).upgradeSchema();
